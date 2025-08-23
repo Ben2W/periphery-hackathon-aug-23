@@ -30,5 +30,7 @@ export default defineSchema({
     versionSpec: v.string(),
     githubUrl: v.optional(v.string()),
     importanceScore: v.optional(v.number()),
+    nicheScore: v.optional(v.number()),
+    signalScore: v.optional(v.number()),
   }).index("by_project", ["projectId"]),
 });

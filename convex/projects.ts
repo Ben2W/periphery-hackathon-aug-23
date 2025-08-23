@@ -189,12 +189,15 @@ export const researchDependencies = internalAction({
 
       const depNames = depsWithMeta.map((d) => d.packageName);
       const instruction =
-        "You are scoring repository relevance for understanding a codebase. " +
-        "Given a list of npm packages, return a JSON object mapping each package name to a float score between 0 and 1. " +
-        "Higher scores indicate technologies that, if known, help someone understand the repo (frameworks, runtimes, routers, state mgmt, ORMs, build tools). " +
-        "Lower scores are utility/helper libraries (date-fns, lodash, uuid). Do not include explanations. JSON only.";
+        "You are scoring repository dependencies for signal. " +
+        "Given a list of npm packages, return a JSON object mapping each package name to two floats in [0,1]: relevance and niche. " +
+        "Relevance: How much knowing this package helps understand the repo (frameworks, runtimes, routers, state mgmt, ORMs, build tools are high). Helpers and utilities are low. " +
+        "Niche: Common/popular packages are low (react, nextjs), niche/less ubiquitous are high (effect, hono, convex, supabase, clerk). " +
+        "Respond with JSON only of shape { pkg: { relevance: number, niche: number } }.";
 
-      const userContent = `Packages: ${JSON.stringify(depNames)}\nReturn JSON mapping package -> score, e.g. {\"react\": 0.95}.`;
+      const userContent = `Packages: ${JSON.stringify(
+        depNames,
+      )}\nReturn JSON mapping package -> {relevance, niche}.`;
 
       const completion = await anthropic.messages.create({
         model: "claude-3-5-sonnet-latest",
@@ -228,18 +231,26 @@ export const researchDependencies = internalAction({
       }
 
       const jsonText = extractJson(text) ?? text;
-      let scores: Record<string, number> = {};
+      let scores: Record<string, { relevance: number; niche: number }> = {};
       try {
         const parsed = JSON.parse(jsonText);
         if (parsed && typeof parsed === "object") {
           for (const [k, v] of Object.entries(parsed)) {
-            const num = Number(v);
-            if (!Number.isNaN(num)) scores[k] = Math.min(1, Math.max(0, num));
+            const rel = Number((v as any)?.relevance);
+            const niche = Number((v as any)?.niche);
+            if (!Number.isNaN(rel) && !Number.isNaN(niche)) {
+              scores[k] = {
+                relevance: Math.min(1, Math.max(0, rel)),
+                niche: Math.min(1, Math.max(0, niche)),
+              };
+            }
           }
         }
       } catch (e) {
         // If parsing fails, fall back to zeros
-        scores = Object.fromEntries(depNames.map((n) => [n, 0]));
+        scores = Object.fromEntries(
+          depNames.map((n) => [n, { relevance: 0, niche: 0 }]),
+        );
       }
 
       await ctx.runMutation(internal.projects.updateDependencyScores, {
@@ -377,7 +388,10 @@ export const upsertProjectDependencies = internalMutation({
 export const updateDependencyScores = internalMutation({
   args: {
     projectId: v.id("projects"),
-    scores: v.record(v.string(), v.number()),
+    scores: v.record(
+      v.string(),
+      v.object({ relevance: v.number(), niche: v.number() }),
+    ),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -387,12 +401,22 @@ export const updateDependencyScores = internalMutation({
       .collect();
     const nameToScore = args.scores;
     for (const row of rows) {
-      const score = nameToScore[row.packageName];
+      const s = nameToScore[row.packageName];
+      const relevance = s?.relevance;
+      const niche = s?.niche;
+      const importance =
+        typeof relevance === "number" && !Number.isNaN(relevance)
+          ? Math.min(1, Math.max(0, relevance))
+          : 0;
+      const nicheScore =
+        typeof niche === "number" && !Number.isNaN(niche)
+          ? Math.min(1, Math.max(0, niche))
+          : 0;
+      const signal = importance * nicheScore;
       await ctx.db.patch(row._id, {
-        importanceScore:
-          typeof score === "number" && !Number.isNaN(score)
-            ? Math.min(1, Math.max(0, score))
-            : 0,
+        importanceScore: importance,
+        nicheScore,
+        signalScore: signal,
       });
     }
     return null;
@@ -410,6 +434,8 @@ export const listRelevantDependencies = query({
       versionSpec: v.string(),
       githubUrl: v.optional(v.string()),
       importanceScore: v.optional(v.number()),
+      nicheScore: v.optional(v.number()),
+      signalScore: v.optional(v.number()),
     }),
   ),
   handler: async (ctx, args) => {
@@ -417,8 +443,19 @@ export const listRelevantDependencies = query({
       .query("projectDependencies")
       .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
       .collect();
-    // Sort by score desc (undefined last)
-    rows.sort((a, b) => (b.importanceScore ?? -1) - (a.importanceScore ?? -1));
+    // Sort by signal desc (undefined last)
+    rows.sort((a, b) => (b.signalScore ?? -1) - (a.signalScore ?? -1));
     return rows;
+  },
+});
+
+export const getSignalCutoff = query({
+  args: {},
+  returns: v.number(),
+  handler: async () => {
+    // Static cutoff tuned to exclude ubiquitous deps like react/next,
+    // while including high-signal tech (effect, hono, convex, clerk, supabase).
+    // Can be adjusted later or made configurable.
+    return 0.35;
   },
 });

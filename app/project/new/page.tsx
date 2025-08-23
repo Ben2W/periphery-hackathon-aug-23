@@ -286,8 +286,7 @@ export default function NewProjectPage() {
           <div className="space-y-1 text-center">
             <div className="text-2xl font-semibold">Analyzing dependencies</div>
             <div className="text-sm text-muted-foreground">
-              This may take up to a minute while we fetch repos and score
-              relevance.
+              This may take a few seconds.
             </div>
           </div>
         </div>

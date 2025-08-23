@@ -52,7 +52,7 @@ export default function ProjectTabs({ projectId }: ProjectTabsProps) {
           aria-current={current === "info" ? "page" : undefined}
           onClick={() => router.push(`/project/${projectId}/info`)}
         >
-          Info
+          Project Details
         </Button>
       </div>
       <Separator />
