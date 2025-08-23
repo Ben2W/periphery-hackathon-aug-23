@@ -187,7 +187,9 @@ export const researchDependencies = internalAction({
         apiKey: process.env.ANTHROPIC_API_KEY,
       });
 
-      const depNames = depsWithMeta.map((d) => d.packageName);
+      // Only analyze dependencies that have a GitHub URL
+      const analyzable = depsWithMeta.filter((d) => !!d.githubUrl);
+      const depNames = analyzable.map((d) => d.packageName);
       const instruction =
         "You are scoring repository dependencies for signal. " +
         "Given a list of npm packages, return a JSON object mapping each package name to two floats in [0,1]: relevance and niche. " +
@@ -401,17 +403,13 @@ export const updateDependencyScores = internalMutation({
       .collect();
     const nameToScore = args.scores;
     for (const row of rows) {
+      // Skip rows that do not have a score (e.g., no GitHub URL analyzed)
       const s = nameToScore[row.packageName];
-      const relevance = s?.relevance;
-      const niche = s?.niche;
-      const importance =
-        typeof relevance === "number" && !Number.isNaN(relevance)
-          ? Math.min(1, Math.max(0, relevance))
-          : 0;
-      const nicheScore =
-        typeof niche === "number" && !Number.isNaN(niche)
-          ? Math.min(1, Math.max(0, niche))
-          : 0;
+      if (!s || !row.githubUrl) continue;
+      const relevance = s.relevance;
+      const niche = s.niche;
+      const importance = Math.min(1, Math.max(0, relevance));
+      const nicheScore = Math.min(1, Math.max(0, niche));
       const signal = importance * nicheScore;
       await ctx.db.patch(row._id, {
         importanceScore: importance,
