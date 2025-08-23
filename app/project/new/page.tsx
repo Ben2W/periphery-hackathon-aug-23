@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useMutation } from "convex/react";
+import { useEffect, useMemo, useState } from "react";
+import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,12 +10,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import Editor from "@monaco-editor/react";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
-import { Plus } from "lucide-react";
+import { Loader2, Plus } from "lucide-react";
 
 export default function NewProjectPage() {
   const router = useRouter();
   const createProject = useMutation(api.projects.createProject);
   const addPackage = useMutation(api.projects.addProjectPackage);
+  const startAnalysis = useMutation(api.projects.startDependencyAnalysis);
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -30,6 +31,19 @@ export default function NewProjectPage() {
   ]);
   const [activeId, setActiveId] = useState<string | undefined>(packages[0]?.id);
   const [step, setStep] = useState<"details" | "packages">("details");
+  const [analyzingId, setAnalyzingId] = useState<string | undefined>(undefined);
+
+  const project = useQuery(
+    api.projects.getProject,
+    analyzingId ? ({ id: analyzingId as any } as any) : "skip",
+  );
+
+  useEffect(() => {
+    if (!project || !analyzingId) return;
+    if (project.analysisStatus === "complete") {
+      router.push(`/project/${analyzingId}/relevant-dependencies`);
+    }
+  }, [project, analyzingId, router]);
 
   const isValidAll = useMemo(() => {
     if (!name.trim()) return false;
@@ -84,8 +98,10 @@ export default function NewProjectPage() {
       for (const p of rest) {
         await addPackage({ projectId, name: p.name, content: p.content });
       }
-      toast.success("Project created");
-      router.push(`/project/${projectId}`);
+      await startAnalysis({ projectId });
+      setAnalyzingId(projectId);
+      toast.success("Project created. Analyzing dependencies...");
+      // Do not navigate yet; overlay will show until analysis completes
     } catch (e) {
       const message =
         e instanceof Error ? e.message : "Failed to create project";
@@ -94,7 +110,7 @@ export default function NewProjectPage() {
   };
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-6 space-y-6 relative">
       <div className="flex items-start justify-between">
         <div className="space-y-2">
           <h1 className="text-2xl font-semibold">New project</h1>
@@ -260,6 +276,18 @@ export default function NewProjectPage() {
               <Button onClick={save} disabled={!isValidAll}>
                 Create project
               </Button>
+            </div>
+          </div>
+        </div>
+      )}
+      {analyzingId && (
+        <div className="absolute inset-0 z-50 bg-background/90 backdrop-blur flex flex-col items-center justify-center gap-6">
+          <Loader2 className="h-16 w-16 animate-spin text-muted-foreground" />
+          <div className="space-y-1 text-center">
+            <div className="text-2xl font-semibold">Analyzing dependencies</div>
+            <div className="text-sm text-muted-foreground">
+              This may take up to a minute while we fetch repos and score
+              relevance.
             </div>
           </div>
         </div>

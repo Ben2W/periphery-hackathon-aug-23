@@ -12,10 +12,23 @@ export default defineSchema({
   projects: defineTable({
     name: v.string(),
     description: v.string(),
+    analysisStatus: v.union(
+      v.literal("pending"),
+      v.literal("processing"),
+      v.literal("complete"),
+      v.literal("failed"),
+    ),
   }),
   projectPackages: defineTable({
     projectId: v.id("projects"),
     name: v.string(),
     content: v.string(),
+  }).index("by_project", ["projectId"]),
+  projectDependencies: defineTable({
+    projectId: v.id("projects"),
+    packageName: v.string(),
+    versionSpec: v.string(),
+    githubUrl: v.optional(v.string()),
+    importanceScore: v.optional(v.number()),
   }).index("by_project", ["projectId"]),
 });
