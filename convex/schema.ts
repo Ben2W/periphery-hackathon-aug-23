@@ -9,4 +9,10 @@ export default defineSchema({
   numbers: defineTable({
     value: v.number(),
   }),
+  projects: defineTable({
+    name: v.string(),
+    description: v.string(),
+    // Store raw package.json as string for now
+    packageJson: v.string(),
+  }),
 });
