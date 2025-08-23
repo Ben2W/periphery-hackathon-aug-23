@@ -16,9 +16,11 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import Editor from "@monaco-editor/react";
+import { useRouter } from "next/navigation";
 
 export default function AddProjectWizard() {
   const createProject = useMutation(api.projects.createProject);
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState<"details" | "package">("details");
   const [name, setName] = useState("");
@@ -43,13 +45,14 @@ export default function AddProjectWizard() {
       return;
     }
     try {
-      await createProject({ name, description, packageJson });
+      const projectId = await createProject({ name, description, packageJson });
       toast.success("Project created");
       setOpen(false);
       setStep("details");
       setName("");
       setDescription("");
       setPackageJson(defaultPackageJson);
+      router.push(`/project/${projectId}`);
     } catch (e) {
       const message =
         e instanceof Error ? e.message : "Failed to create project";

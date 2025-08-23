@@ -31,7 +31,6 @@ export const getProject = query({
       _creationTime: v.number(),
       name: v.string(),
       description: v.string(),
-      packageJson: v.string(),
     }),
     v.null(),
   ),
@@ -43,7 +42,6 @@ export const getProject = query({
       _creationTime: doc._creationTime,
       name: doc.name,
       description: doc.description,
-      packageJson: doc.packageJson,
     };
   },
 });
@@ -53,6 +51,7 @@ export const createProject = mutation({
     name: v.string(),
     description: v.string(),
     packageJson: v.string(),
+    packageName: v.optional(v.string()),
   },
   returns: v.id("projects"),
   handler: async (ctx, args) => {
@@ -65,7 +64,11 @@ export const createProject = mutation({
     const id = await ctx.db.insert("projects", {
       name: args.name,
       description: args.description,
-      packageJson: args.packageJson,
+    });
+    await ctx.db.insert("projectPackages", {
+      projectId: id,
+      name: args.packageName ?? "package.json",
+      content: args.packageJson,
     });
     // Schedule research workflow scaffold (no-op for now)
     await ctx.scheduler.runAfter(0, internal.projects.researchDependencies, {
@@ -83,5 +86,52 @@ export const researchDependencies = internalAction({
     // Intentionally left unimplemented per requirements.
     console.log("Research workflow queued for", String(args.projectId));
     return null;
+  },
+});
+
+export const listProjectPackages = query({
+  args: { projectId: v.id("projects") },
+  returns: v.array(
+    v.object({
+      _id: v.id("projectPackages"),
+      _creationTime: v.number(),
+      projectId: v.id("projects"),
+      name: v.string(),
+      content: v.string(),
+    }),
+  ),
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("projectPackages")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .order("desc")
+      .collect();
+    return rows;
+  },
+});
+
+export const addProjectPackage = mutation({
+  args: {
+    projectId: v.id("projects"),
+    name: v.string(),
+    content: v.string(),
+  },
+  returns: v.id("projectPackages"),
+  handler: async (ctx, args) => {
+    try {
+      JSON.parse(args.content);
+    } catch (e) {
+      throw new Error("content must be valid JSON string");
+    }
+    const exists = await ctx.db.get(args.projectId);
+    if (!exists) {
+      throw new Error("Project not found");
+    }
+    const id = await ctx.db.insert("projectPackages", {
+      projectId: args.projectId,
+      name: args.name,
+      content: args.content,
+    });
+    return id;
   },
 });

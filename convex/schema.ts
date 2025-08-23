@@ -12,7 +12,10 @@ export default defineSchema({
   projects: defineTable({
     name: v.string(),
     description: v.string(),
-    // Store raw package.json as string for now
-    packageJson: v.string(),
   }),
+  projectPackages: defineTable({
+    projectId: v.id("projects"),
+    name: v.string(),
+    content: v.string(),
+  }).index("by_project", ["projectId"]),
 });
