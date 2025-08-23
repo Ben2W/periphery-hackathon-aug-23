@@ -28,7 +28,7 @@ export default function NewProjectPage() {
       content: defaultPackageJson,
     },
   ]);
-  const [activeId, setActiveId] = useState(packages[0].id);
+  const [activeId, setActiveId] = useState<string | undefined>(packages[0]?.id);
   const [step, setStep] = useState<"details" | "packages">("details");
 
   const isValidAll = useMemo(() => {
@@ -59,15 +59,15 @@ export default function NewProjectPage() {
   const removePackage = (id: string) => {
     setPackages((prev) => {
       const remaining = prev.filter((p) => p.id !== id);
-      if (id === activeId && remaining.length > 0) {
-        setActiveId(remaining[0].id);
+      if (id === activeId) {
+        setActiveId(remaining[0]?.id);
       }
       return remaining;
     });
   };
 
   const save = async () => {
-    if (!isValidAll || packages.length === 0) {
+    if (!isValidAll || !packages[0]) {
       toast.error("Name required and at least one valid package.json");
       return;
     }
