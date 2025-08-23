@@ -160,7 +160,7 @@ export default function NewProjectPage() {
         </div>
       ) : (
         <div className="space-y-4">
-          <div className="text-sm font-medium">package.json files</div>
+          <div className="text-sm font-medium">Add your package.json files</div>
           {packages.length === 0 ? (
             <div className="border rounded-md p-6 text-sm text-muted-foreground flex items-center justify-between">
               <span>
