@@ -86,7 +86,7 @@ export function PeopleGrid({
               <div className="mt-2 flex flex-wrap gap-2">
                 {p.breakdown.map((b) => (
                   <Badge key={`${b.owner}/${b.repo}`} variant="secondary">
-                    {b.packageName}: {b.commits}
+                    {b.packageName}
                   </Badge>
                 ))}
               </div>
