@@ -620,6 +620,28 @@ export const fetchIssueCreators = internalAction({
   },
 });
 
+// Fetch public members of an organization. GitHub only returns public members here.
+export const fetchOrgPublicMembers = internalAction({
+  args: { org: v.string() },
+  returns: v.array(v.string()),
+  handler: async (ctx, args) => {
+    const token = process.env.GITHUB_TOKEN;
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "periphery-app",
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    // Note: Only public members are returned. That's sufficient to exclude many maintainers.
+    const url = `https://api.github.com/orgs/${args.org}/members?per_page=100`;
+    const res = await fetch(url, { headers });
+    if (!res.ok) return [];
+    const data = (await res.json()) as Array<any>;
+    return data
+      .map((u) => (u && typeof u.login === "string" ? u.login : undefined))
+      .filter((x): x is string => !!x);
+  },
+});
+
 export const processRepo = internalAction({
   args: { projectId: v.id("projects"), owner: v.string(), repo: v.string() },
   returns: v.null(),
@@ -630,7 +652,11 @@ export const processRepo = internalAction({
       message: `Fetching repo ${args.owner}/${args.repo}`,
       step: "fetch_repo",
     });
-    const [committers, issuers] = await Promise.all([
+    // Fetch org public members to exclude first-party maintainers
+    const [orgMembers, committers, issuers] = await Promise.all([
+      ctx.runAction(internal.projects.fetchOrgPublicMembers, {
+        org: args.owner,
+      }),
       ctx.runAction(internal.projects.fetchCommitContributors, {
         owner: args.owner,
         repo: args.repo,
@@ -640,7 +666,27 @@ export const processRepo = internalAction({
         repo: args.repo,
       }),
     ]);
-    for (const c of committers) {
+    const memberSet: Record<string, true> = Object.create(null);
+    for (const m of orgMembers) memberSet[m] = true;
+    const filteredCommitters = committers.filter((c) => !memberSet[c.login]);
+    const filteredIssuers = issuers.filter((i) => !memberSet[i.login]);
+
+    // Optionally log how many were excluded for transparency
+    if (orgMembers.length > 0) {
+      const excluded =
+        committers.length +
+        issuers.length -
+        (filteredCommitters.length + filteredIssuers.length);
+      if (excluded > 0) {
+        await ctx.runMutation(internal.projects.appendGithubLog, {
+          projectId: args.projectId,
+          level: "info",
+          message: `Excluded ${excluded} org member(s) from ${args.owner}`,
+          step: "exclude_org_members",
+        });
+      }
+    }
+    for (const c of filteredCommitters) {
       await ctx.runMutation(internal.projects.mergeUserInfluence, {
         projectId: args.projectId,
         username: c.login,
@@ -649,7 +695,7 @@ export const processRepo = internalAction({
         issuesDelta: 0,
       });
     }
-    for (const i of issuers) {
+    for (const i of filteredIssuers) {
       await ctx.runMutation(internal.projects.mergeUserInfluence, {
         projectId: args.projectId,
         username: i.login,
