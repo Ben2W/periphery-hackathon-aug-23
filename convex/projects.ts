@@ -130,10 +130,13 @@ export const researchDependencies = internalAction({
             dependencies?: Record<string, string>;
             devDependencies?: Record<string, string>;
           };
-          const all: Array<[string, string]> = Object.entries(
+          // Only include runtime dependencies; ignore devDependencies
+          const runtimeDeps: Array<[string, string]> = Object.entries(
             json.dependencies ?? {},
-          ).concat(Object.entries(json.devDependencies ?? {}));
-          for (const [name, version] of all) {
+          );
+          for (const [name, version] of runtimeDeps) {
+            const versionSpec = String(version).trim().toLowerCase();
+            if (versionSpec.startsWith("workspace")) continue;
             if (!depToVersion.has(name)) depToVersion.set(name, version);
           }
         } catch (e) {
@@ -577,7 +580,7 @@ export const fetchCommitContributors = internalAction({
     if (!res.ok) return [];
     const data = (await res.json()) as Array<any>;
     return data
-      .filter((u) => u && u.login)
+      .filter((u) => u && u.login && !u.login.endsWith("[bot]"))
       .map((u) => ({
         login: u.login,
         html_url: u.html_url,
@@ -611,6 +614,7 @@ export const fetchIssueCreators = internalAction({
     for (const it of data) {
       const user = it?.user;
       if (!user || !user.login) continue;
+      if (user.login.endsWith("[bot]")) continue;
       const key = user.login;
       if (!counts[key])
         counts[key] = { login: user.login, html_url: user.html_url, count: 0 };
@@ -668,8 +672,12 @@ export const processRepo = internalAction({
     ]);
     const memberSet: Record<string, true> = Object.create(null);
     for (const m of orgMembers) memberSet[m] = true;
-    const filteredCommitters = committers.filter((c) => !memberSet[c.login]);
-    const filteredIssuers = issuers.filter((i) => !memberSet[i.login]);
+    const filteredCommitters = committers.filter(
+      (c) => !memberSet[c.login] && !c.login.endsWith("[bot]"),
+    );
+    const filteredIssuers = issuers.filter(
+      (i) => !memberSet[i.login] && !i.login.endsWith("[bot]"),
+    );
 
     // Optionally log how many were excluded for transparency
     if (orgMembers.length > 0) {
@@ -944,6 +952,171 @@ export const listGithubInfluence = query({
       .collect();
     rows.sort((a, b) => b.commits + b.issues - (a.commits + a.issues));
     return rows;
+  },
+});
+
+export const listGithubInfluenceWithRepos = query({
+  args: {
+    projectId: v.id("projects"),
+    filters: v.optional(
+      v.array(v.object({ owner: v.string(), repo: v.string() })),
+    ),
+  },
+  returns: v.object({
+    repos: v.array(
+      v.object({
+        owner: v.string(),
+        repo: v.string(),
+        repoKey: v.string(),
+        packageName: v.string(),
+        userCount: v.number(),
+      }),
+    ),
+    people: v.array(
+      v.object({
+        username: v.string(),
+        htmlUrl: v.optional(v.string()),
+        totalCommits: v.number(),
+        totalIssues: v.number(),
+        breakdown: v.array(
+          v.object({
+            owner: v.string(),
+            repo: v.string(),
+            packageName: v.string(),
+            commits: v.number(),
+            issues: v.number(),
+          }),
+        ),
+      }),
+    ),
+  }),
+  handler: async (ctx, args) => {
+    // Gather relevant repos with package names
+    const deps: Array<{ packageName: string; githubUrl: string }> =
+      await ctx.runQuery(internal.projects._listDepsWithGithub, {
+        projectId: args.projectId,
+      });
+    const repoKeyToPkg: Record<string, string> = Object.create(null);
+    const allowedRepoKeys: Set<string> = new Set();
+    for (const d of deps) {
+      const { owner, repo } = parseGithub(d.githubUrl);
+      const key = `${owner}/${repo}`;
+      repoKeyToPkg[key] = d.packageName;
+      allowedRepoKeys.add(key);
+    }
+    const selectedRepoKeys: Set<string> = new Set(
+      args.filters && args.filters.length > 0
+        ? args.filters
+            .map((f) => `${f.owner}/${f.repo}`)
+            .filter((k) => allowedRepoKeys.has(k))
+        : Array.from(allowedRepoKeys),
+    );
+
+    // Preload overall user info (for htmlUrl)
+    const userRows = await ctx.db
+      .query("githubUserInfluence")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .collect();
+    const userToMeta: Record<string, { htmlUrl?: string }> =
+      Object.create(null);
+    for (const u of userRows) userToMeta[u.username] = { htmlUrl: u.htmlUrl };
+
+    // For each selected repo, gather per-user rows
+    type RepoAgg = {
+      owner: string;
+      repo: string;
+      username: string;
+      commits: number;
+      issues: number;
+    };
+    const repoAggs: Array<RepoAgg> = [];
+    const repoUserSets: Record<string, Set<string>> = Object.create(null);
+    for (const key of selectedRepoKeys) {
+      const [owner, repo] = key.split("/");
+      const rows = (await ctx.db
+        .query("githubUserRepoInfluence")
+        .withIndex("by_project_owner_repo", (q) =>
+          q.eq("projectId", args.projectId).eq("owner", owner).eq("repo", repo),
+        )
+        .collect()) as Array<{
+        username: string;
+        commits: number;
+        issues: number;
+      }>;
+      for (const r of rows) {
+        if (!repoUserSets[key]) repoUserSets[key] = new Set();
+        repoUserSets[key].add(r.username);
+        repoAggs.push({
+          owner,
+          repo,
+          username: r.username,
+          commits: r.commits,
+          issues: r.issues,
+        });
+      }
+    }
+
+    // Build repo list with counts
+    const repos = Array.from(selectedRepoKeys).map((key) => {
+      const [owner, repo] = key.split("/");
+      const userCount = repoUserSets[key]?.size ?? 0;
+      return {
+        owner,
+        repo,
+        repoKey: key,
+        packageName: repoKeyToPkg[key] ?? `${owner}/${repo}`,
+        userCount,
+      };
+    });
+
+    // Aggregate per user across selected repos
+    const userToBreakdown: Record<
+      string,
+      Array<{
+        owner: string;
+        repo: string;
+        packageName: string;
+        commits: number;
+        issues: number;
+      }>
+    > = Object.create(null);
+    const userTotals: Record<string, { commits: number; issues: number }> =
+      Object.create(null);
+    for (const r of repoAggs) {
+      const key = `${r.owner}/${r.repo}`;
+      const arr = (userToBreakdown[r.username] =
+        userToBreakdown[r.username] || []);
+      arr.push({
+        owner: r.owner,
+        repo: r.repo,
+        packageName: repoKeyToPkg[key] ?? key,
+        commits: r.commits,
+        issues: r.issues,
+      });
+      const t = (userTotals[r.username] = userTotals[r.username] || {
+        commits: 0,
+        issues: 0,
+      });
+      t.commits += r.commits;
+      t.issues += r.issues;
+    }
+
+    const people = Object.keys(userToBreakdown)
+      .map((username) => ({
+        username,
+        htmlUrl: userToMeta[username]?.htmlUrl,
+        totalCommits: userTotals[username]?.commits ?? 0,
+        totalIssues: userTotals[username]?.issues ?? 0,
+        breakdown: userToBreakdown[username].sort(
+          (a, b) => b.commits + b.issues - (a.commits + a.issues),
+        ),
+      }))
+      .sort(
+        (a, b) =>
+          b.totalCommits + b.totalIssues - (a.totalCommits + a.totalIssues),
+      );
+
+    return { repos, people };
   },
 });
 
