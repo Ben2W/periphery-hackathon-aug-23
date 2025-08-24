@@ -33,4 +33,26 @@ export default defineSchema({
     nicheScore: v.optional(v.number()),
     signalScore: v.optional(v.number()),
   }).index("by_project", ["projectId"]),
+  githubScrapes: defineTable({
+    projectId: v.id("projects"),
+    finishedScrapingGithub: v.boolean(),
+    totalRepos: v.optional(v.number()),
+    processedRepos: v.optional(v.number()),
+    percent: v.optional(v.number()),
+  }).index("by_project", ["projectId"]),
+  githubScrapeLogs: defineTable({
+    projectId: v.id("projects"),
+    level: v.string(),
+    message: v.string(),
+    step: v.optional(v.string()),
+  }).index("by_project", ["projectId"]),
+  githubUserInfluence: defineTable({
+    projectId: v.id("projects"),
+    username: v.string(),
+    htmlUrl: v.string(),
+    commits: v.number(),
+    issues: v.number(),
+  })
+    .index("by_project", ["projectId"])
+    .index("by_project_and_username", ["projectId", "username"]),
 });

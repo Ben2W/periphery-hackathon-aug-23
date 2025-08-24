@@ -4,8 +4,11 @@ import {
   mutation,
   internalAction,
   internalMutation,
+  internalQuery,
 } from "./_generated/server";
 import { api, internal } from "./_generated/api";
+import { WorkflowManager } from "@convex-dev/workflow";
+import { components } from "./_generated/api";
 
 export const listProjects = query({
   args: {},
@@ -264,6 +267,11 @@ export const researchDependencies = internalAction({
         projectId,
         status: "complete",
       });
+
+      // Kick off GitHub scraping workflow now that analysis is complete
+      await workflow.start(ctx, internal.projects.scrapeGithubWorkflow, {
+        projectId,
+      });
     } catch (e) {
       console.error("Dependency research failed", e);
       await ctx.runMutation(internal.projects.setAnalysisStatus, {
@@ -455,5 +463,389 @@ export const getSignalCutoff = query({
     // while including high-signal tech (effect, hono, convex, clerk, supabase).
     // Can be adjusted later or made configurable.
     return 0.35;
+  },
+});
+
+// Initialize workflow manager for installed component
+export const workflow = new WorkflowManager(components.workflow);
+
+export const scrapeGithubWorkflow = workflow.define({
+  args: { projectId: v.id("projects") },
+  // explicit return type for determinism typing
+  handler: async (step, args): Promise<void> => {
+    // Mark scrape row started
+    await step.runMutation(internal.projects.upsertGithubScrape, {
+      projectId: args.projectId,
+      finished: false,
+      totalRepos: 0,
+      processedRepos: 0,
+      percent: 0,
+    });
+
+    // Load dependencies with GitHub URLs
+    const deps: Array<{ packageName: string; githubUrl: string }> =
+      await step.runQuery(internal.projects._listDepsWithGithub, {
+        projectId: args.projectId,
+      });
+    await step.runMutation(internal.projects.upsertGithubScrape, {
+      projectId: args.projectId,
+      finished: false,
+      totalRepos: deps.length,
+      processedRepos: 0,
+      percent: deps.length === 0 ? 100 : 0,
+    });
+    await step.runMutation(internal.projects.appendGithubLog, {
+      projectId: args.projectId,
+      level: "info",
+      message: `Starting GitHub scrape for ${deps.length} repos`,
+      step: "start",
+    });
+
+    // Process repos sequentially via an action per repo
+    for (const d of deps) {
+      const { owner, repo } = parseGithub(d.githubUrl);
+      await step.runAction(internal.projects.processRepo, {
+        projectId: args.projectId,
+        owner,
+        repo,
+      });
+    }
+
+    // Mark finished
+    await step.runMutation(internal.projects.upsertGithubScrape, {
+      projectId: args.projectId,
+      finished: true,
+      processedRepos: deps.length,
+      percent: 100,
+    });
+    await step.runMutation(internal.projects.appendGithubLog, {
+      projectId: args.projectId,
+      level: "info",
+      message: `Finished GitHub scrape for ${deps.length} repos`,
+      step: "done",
+    });
+  },
+});
+
+function parseGithub(url?: string): { owner: string; repo: string } {
+  if (!url) throw new Error("Missing GitHub URL");
+  // supports https://github.com/owner/repo or with trailing parts
+  const m = url.match(/github\.com\/(.*?)\/(.*?)(?:$|\.|\/)/i);
+  if (!m) throw new Error("Invalid GitHub URL: " + url);
+  return { owner: m[1], repo: m[2] };
+}
+
+export const _listDepsWithGithub = internalQuery({
+  args: { projectId: v.id("projects") },
+  returns: v.array(
+    v.object({ packageName: v.string(), githubUrl: v.string() }),
+  ),
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("projectDependencies")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .collect();
+    const cutoff: number = await ctx.runQuery(
+      api.projects.getSignalCutoff,
+      {} as any,
+    );
+    return rows
+      .filter(
+        (r) =>
+          !!r.githubUrl &&
+          typeof r.signalScore === "number" &&
+          r.signalScore >= cutoff,
+      )
+      .map((r) => ({ packageName: r.packageName, githubUrl: r.githubUrl! }));
+  },
+});
+
+export const fetchCommitContributors = internalAction({
+  args: { owner: v.string(), repo: v.string() },
+  returns: v.array(
+    v.object({ login: v.string(), html_url: v.string(), count: v.number() }),
+  ),
+  handler: async (ctx, args) => {
+    const token = process.env.GITHUB_TOKEN;
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "periphery-app",
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const url = `https://api.github.com/repos/${args.owner}/${args.repo}/contributors?per_page=100&anon=false`;
+    const res = await fetch(url, { headers });
+    if (!res.ok) return [];
+    const data = (await res.json()) as Array<any>;
+    return data
+      .filter((u) => u && u.login)
+      .map((u) => ({
+        login: u.login,
+        html_url: u.html_url,
+        count: u.contributions ?? 0,
+      }));
+  },
+});
+
+export const fetchIssueCreators = internalAction({
+  args: { owner: v.string(), repo: v.string() },
+  returns: v.array(
+    v.object({ login: v.string(), html_url: v.string(), count: v.number() }),
+  ),
+  handler: async (ctx, args) => {
+    const token = process.env.GITHUB_TOKEN;
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "periphery-app",
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    // Use issues events to count unique creators and their counts
+    // For simplicity, fetch recent 100 issues and aggregate by user
+    const url = `https://api.github.com/repos/${args.owner}/${args.repo}/issues?state=all&per_page=100`;
+    const res = await fetch(url, { headers });
+    if (!res.ok) return [];
+    const data = (await res.json()) as Array<any>;
+    const counts: Record<
+      string,
+      { login: string; html_url: string; count: number }
+    > = {};
+    for (const it of data) {
+      const user = it?.user;
+      if (!user || !user.login) continue;
+      const key = user.login;
+      if (!counts[key])
+        counts[key] = { login: user.login, html_url: user.html_url, count: 0 };
+      counts[key].count += 1;
+    }
+    return Object.values(counts);
+  },
+});
+
+export const processRepo = internalAction({
+  args: { projectId: v.id("projects"), owner: v.string(), repo: v.string() },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.runMutation(internal.projects.appendGithubLog, {
+      projectId: args.projectId,
+      level: "info",
+      message: `Fetching repo ${args.owner}/${args.repo}`,
+      step: "fetch_repo",
+    });
+    const [committers, issuers] = await Promise.all([
+      ctx.runAction(internal.projects.fetchCommitContributors, {
+        owner: args.owner,
+        repo: args.repo,
+      }),
+      ctx.runAction(internal.projects.fetchIssueCreators, {
+        owner: args.owner,
+        repo: args.repo,
+      }),
+    ]);
+    for (const c of committers) {
+      await ctx.runMutation(internal.projects.mergeUserInfluence, {
+        projectId: args.projectId,
+        username: c.login,
+        htmlUrl: c.html_url,
+        commitsDelta: c.count,
+        issuesDelta: 0,
+      });
+    }
+    for (const i of issuers) {
+      await ctx.runMutation(internal.projects.mergeUserInfluence, {
+        projectId: args.projectId,
+        username: i.login,
+        htmlUrl: i.html_url,
+        commitsDelta: 0,
+        issuesDelta: i.count,
+      });
+    }
+    await ctx.runMutation(internal.projects.incrementGithubProcessed, {
+      projectId: args.projectId,
+    });
+    const row = await ctx.runQuery(api.projects.getGithubScrape, {
+      projectId: args.projectId,
+    });
+    await ctx.runMutation(internal.projects.appendGithubLog, {
+      projectId: args.projectId,
+      level: "info",
+      message: `Processed ${args.owner}/${args.repo} (${row?.processedRepos ?? 0}/${row?.totalRepos ?? 0})`,
+      step: "progress",
+    });
+    return null;
+  },
+});
+
+export const incrementGithubProcessed = internalMutation({
+  args: { projectId: v.id("projects") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("githubScrapes")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .unique();
+    if (!existing) return null;
+    const total = existing.totalRepos ?? 0;
+    const nextProcessed = (existing.processedRepos ?? 0) + 1;
+    const percent = Math.round((nextProcessed / Math.max(1, total)) * 100);
+    await ctx.db.patch(existing._id, {
+      processedRepos: nextProcessed,
+      percent,
+    });
+    return null;
+  },
+});
+
+// --- GitHub scraping support ---
+export const getGithubScrape = query({
+  args: { projectId: v.id("projects") },
+  returns: v.union(
+    v.object({
+      _id: v.id("githubScrapes"),
+      _creationTime: v.number(),
+      projectId: v.id("projects"),
+      finishedScrapingGithub: v.boolean(),
+      totalRepos: v.optional(v.number()),
+      processedRepos: v.optional(v.number()),
+      percent: v.optional(v.number()),
+    }),
+    v.null(),
+  ),
+  handler: async (ctx, args) => {
+    const row = await ctx.db
+      .query("githubScrapes")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .unique();
+    return row ?? null;
+  },
+});
+
+export const listGithubInfluence = query({
+  args: { projectId: v.id("projects") },
+  returns: v.array(
+    v.object({
+      _id: v.id("githubUserInfluence"),
+      _creationTime: v.number(),
+      projectId: v.id("projects"),
+      username: v.string(),
+      htmlUrl: v.string(),
+      commits: v.number(),
+      issues: v.number(),
+    }),
+  ),
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("githubUserInfluence")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .collect();
+    rows.sort((a, b) => b.commits + b.issues - (a.commits + a.issues));
+    return rows;
+  },
+});
+
+export const upsertGithubScrape = internalMutation({
+  args: {
+    projectId: v.id("projects"),
+    finished: v.boolean(),
+    totalRepos: v.optional(v.number()),
+    processedRepos: v.optional(v.number()),
+    percent: v.optional(v.number()),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("githubScrapes")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .unique();
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        finishedScrapingGithub: args.finished,
+        totalRepos: args.totalRepos ?? existing.totalRepos,
+        processedRepos: args.processedRepos ?? existing.processedRepos,
+        percent: args.percent ?? existing.percent,
+      });
+    } else {
+      await ctx.db.insert("githubScrapes", {
+        projectId: args.projectId,
+        finishedScrapingGithub: args.finished,
+        totalRepos: args.totalRepos,
+        processedRepos: args.processedRepos,
+        percent: args.percent,
+      });
+    }
+    return null;
+  },
+});
+
+export const appendGithubLog = internalMutation({
+  args: {
+    projectId: v.id("projects"),
+    level: v.string(),
+    message: v.string(),
+    step: v.optional(v.string()),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.insert("githubScrapeLogs", {
+      projectId: args.projectId,
+      level: args.level,
+      message: args.message,
+      step: args.step,
+    });
+    return null;
+  },
+});
+
+export const listGithubLogs = query({
+  args: { projectId: v.id("projects") },
+  returns: v.array(
+    v.object({
+      _id: v.id("githubScrapeLogs"),
+      _creationTime: v.number(),
+      projectId: v.id("projects"),
+      level: v.string(),
+      message: v.string(),
+      step: v.optional(v.string()),
+    }),
+  ),
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("githubScrapeLogs")
+      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
+      .order("desc")
+      .take(200);
+    return rows;
+  },
+});
+
+export const mergeUserInfluence = internalMutation({
+  args: {
+    projectId: v.id("projects"),
+    username: v.string(),
+    htmlUrl: v.string(),
+    commitsDelta: v.number(),
+    issuesDelta: v.number(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("githubUserInfluence")
+      .withIndex("by_project_and_username", (q) =>
+        q.eq("projectId", args.projectId).eq("username", args.username),
+      )
+      .unique();
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        commits: existing.commits + args.commitsDelta,
+        issues: existing.issues + args.issuesDelta,
+      });
+    } else {
+      await ctx.db.insert("githubUserInfluence", {
+        projectId: args.projectId,
+        username: args.username,
+        htmlUrl: args.htmlUrl,
+        commits: args.commitsDelta,
+        issues: args.issuesDelta,
+      });
+    }
+    return null;
   },
 });
