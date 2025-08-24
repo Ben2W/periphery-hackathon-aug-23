@@ -4,6 +4,7 @@ import { useParams } from "next/navigation";
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Button } from "@/components/ui/button";
+import Link from "next/link";
 import {
   Dialog,
   DialogContent,
@@ -79,18 +80,27 @@ export default function RelevantPeoplePage() {
         {people?.map((p) => {
           const score = p.commits + p.issues;
           return (
-            <a
+            <Link
               key={p._id}
-              href={p.htmlUrl}
-              target="_blank"
-              rel="noreferrer"
+              href={`/project/${projectId}/githubUser/${p.username}`}
               className="block border rounded-md p-4 hover:bg-muted/50 transition"
             >
-              <div className="font-medium">{p.username}</div>
+              <div className="font-medium flex items-center gap-2">
+                <span>{p.username}</span>
+                <a
+                  href={p.htmlUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs text-muted-foreground hover:underline"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  (GitHub)
+                </a>
+              </div>
               <div className="text-sm text-muted-foreground">
                 {p.commits} commits • {p.issues} issues • Influence {score}
               </div>
-            </a>
+            </Link>
           );
         })}
       </div>

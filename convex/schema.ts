@@ -55,4 +55,14 @@ export default defineSchema({
   })
     .index("by_project", ["projectId"])
     .index("by_project_and_username", ["projectId", "username"]),
+  githubUserRepoInfluence: defineTable({
+    projectId: v.id("projects"),
+    username: v.string(),
+    owner: v.string(),
+    repo: v.string(),
+    commits: v.number(),
+    issues: v.number(),
+  })
+    .index("by_project_and_username", ["projectId", "username"]) // list repos for a user
+    .index("by_project_owner_repo", ["projectId", "owner", "repo"]), // locate per-repo entries
 });

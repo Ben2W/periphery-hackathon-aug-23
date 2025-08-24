@@ -686,7 +686,11 @@ export const processRepo = internalAction({
         });
       }
     }
-    for (const c of filteredCommitters) {
+    for (const c of filteredCommitters as Array<{
+      login: string;
+      html_url: string;
+      count: number;
+    }>) {
       await ctx.runMutation(internal.projects.mergeUserInfluence, {
         projectId: args.projectId,
         username: c.login,
@@ -694,12 +698,32 @@ export const processRepo = internalAction({
         commitsDelta: c.count,
         issuesDelta: 0,
       });
+      await ctx.runMutation(internal.projects.mergeRepoUserInfluence, {
+        projectId: args.projectId,
+        username: c.login,
+        owner: args.owner,
+        repo: args.repo,
+        commitsDelta: c.count,
+        issuesDelta: 0,
+      });
     }
-    for (const i of filteredIssuers) {
+    for (const i of filteredIssuers as Array<{
+      login: string;
+      html_url: string;
+      count: number;
+    }>) {
       await ctx.runMutation(internal.projects.mergeUserInfluence, {
         projectId: args.projectId,
         username: i.login,
         htmlUrl: i.html_url,
+        commitsDelta: 0,
+        issuesDelta: i.count,
+      });
+      await ctx.runMutation(internal.projects.mergeRepoUserInfluence, {
+        projectId: args.projectId,
+        username: i.login,
+        owner: args.owner,
+        repo: args.repo,
         commitsDelta: 0,
         issuesDelta: i.count,
       });
@@ -717,6 +741,142 @@ export const processRepo = internalAction({
       step: "progress",
     });
     return null;
+  },
+});
+
+export const mergeRepoUserInfluence = internalMutation({
+  args: {
+    projectId: v.id("projects"),
+    username: v.string(),
+    owner: v.string(),
+    repo: v.string(),
+    commitsDelta: v.number(),
+    issuesDelta: v.number(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("githubUserRepoInfluence")
+      .withIndex("by_project_owner_repo", (q) =>
+        q
+          .eq("projectId", args.projectId)
+          .eq("owner", args.owner)
+          .eq("repo", args.repo),
+      )
+      .collect();
+    // There may be multiple users per repo; filter again by username
+    const row = existing.find((r) => r.username === args.username);
+    if (row) {
+      await ctx.db.patch(row._id, {
+        commits: row.commits + args.commitsDelta,
+        issues: row.issues + args.issuesDelta,
+      });
+    } else {
+      await ctx.db.insert("githubUserRepoInfluence", {
+        projectId: args.projectId,
+        username: args.username,
+        owner: args.owner,
+        repo: args.repo,
+        commits: args.commitsDelta,
+        issues: args.issuesDelta,
+      });
+    }
+    return null;
+  },
+});
+
+export const getGithubUserDetail = query({
+  args: { projectId: v.id("projects"), username: v.string() },
+  returns: v.object({
+    username: v.string(),
+    htmlUrl: v.optional(v.string()),
+    totalCommits: v.number(),
+    totalIssues: v.number(),
+    affectedRepos: v.number(),
+    totalRelevantRepos: v.number(),
+    repos: v.array(
+      v.object({
+        owner: v.string(),
+        repo: v.string(),
+        commits: v.number(),
+        issues: v.number(),
+        repoUrl: v.string(),
+        commitsUrl: v.string(),
+        issuesUrl: v.string(),
+      }),
+    ),
+  }),
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    username: string;
+    htmlUrl?: string;
+    totalCommits: number;
+    totalIssues: number;
+    affectedRepos: number;
+    totalRelevantRepos: number;
+    repos: Array<{
+      owner: string;
+      repo: string;
+      commits: number;
+      issues: number;
+      repoUrl: string;
+      commitsUrl: string;
+      issuesUrl: string;
+    }>;
+  }> => {
+    const agg = await ctx.db
+      .query("githubUserInfluence")
+      .withIndex("by_project_and_username", (q) =>
+        q.eq("projectId", args.projectId).eq("username", args.username),
+      )
+      .unique();
+    const rows = (await ctx.db
+      .query("githubUserRepoInfluence")
+      .withIndex("by_project_and_username", (q) =>
+        q.eq("projectId", args.projectId).eq("username", args.username),
+      )
+      .collect()) as Array<{
+      owner: string;
+      repo: string;
+      commits: number;
+      issues: number;
+    }>;
+    const deps: Array<{ packageName: string; githubUrl: string }> =
+      await ctx.runQuery(internal.projects._listDepsWithGithub, {
+        projectId: args.projectId,
+      });
+    const totalRelevantRepos: number = deps.length;
+    const repos = rows.map((r) => {
+      const owner = r.owner;
+      const repo = r.repo;
+      const repoUrl = `https://github.com/${owner}/${repo}`;
+      const commitsUrl = `${repoUrl}/commits?author=${encodeURIComponent(args.username)}`;
+      const issuesUrl = `${repoUrl}/issues?q=${encodeURIComponent(
+        `author:${args.username}`,
+      )}`;
+      return {
+        owner,
+        repo,
+        commits: r.commits,
+        issues: r.issues,
+        repoUrl,
+        commitsUrl,
+        issuesUrl,
+      };
+    });
+    // Sort by combined influence per repo desc
+    repos.sort((a, b) => b.commits + b.issues - (a.commits + a.issues));
+    return {
+      username: args.username,
+      htmlUrl: agg?.htmlUrl,
+      totalCommits: agg?.commits ?? 0,
+      totalIssues: agg?.issues ?? 0,
+      affectedRepos: repos.length,
+      totalRelevantRepos,
+      repos,
+    };
   },
 });
 
